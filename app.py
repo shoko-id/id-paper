@@ -14,7 +14,7 @@ st.set_page_config(
     layout="wide",
 )
 
-MODEL_NAME = "gemini-3.8-flash"
+MODEL_NAME = "gemini-3.5-flash-lite"
 
 COACH_SYSTEM_PROMPT = """
 あなたは、鈴木克明先生や熊本大学教授システム学専攻（GSIS）のインストラクショナルデザイン（学習者中心、ARCSモデル、ID第一原理、入口・出口・構造など）の知見を背景に持つ、熟練の教育コーチです。
