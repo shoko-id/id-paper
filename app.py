@@ -1,5 +1,6 @@
 import datetime
 import json
+import time
 import requests
 import streamlit as st
 from google import genai
@@ -10,6 +11,8 @@ st.set_page_config(
     page_icon="🧭",
     layout="wide",
 )
+
+MODEL_NAME = "gemini-3.8-flash"
 
 COACH_SYSTEM_PROMPT = """
 あなたは、鈴木克明先生や熊本大学教授システム学専攻（GSIS）のインストラクショナルデザイン（学習者中心、ARCSモデル、ID第一原理、入口・出口・構造など）の知見を背景に持つ、熟練の教育コーチです。
@@ -32,8 +35,19 @@ def reconstruct_abstract(inv_index: dict | None) -> str:
     return " ".join(words[i] for i in sorted(words))
 
 
+def generate_with_retry(client: genai.Client, **kwargs):
+    for attempt in range(3):
+        try:
+            return client.models.generate_content(**kwargs)
+        except Exception as e:
+            if "503" in str(e) and attempt < 2:
+                time.sleep(2 * (attempt + 1))
+                continue
+            raise
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_openalex_papers(query: str, days: int, max_results: int = 8) -> list[dict]:
+def fetch_openalex_papers(query: str, days: int, max_results: int = 5) -> list[dict]:
     since_date = (datetime.date.today() - datetime.timedelta(days=days)).isoformat()
     url = "https://api.openalex.org/works"
     params = {
@@ -60,7 +74,7 @@ def fetch_openalex_papers(query: str, days: int, max_results: int = 8) -> list[d
                 "date": item.get("publication_date", ""),
                 "journal": source.get("display_name", "Unknown Journal"),
                 "doi": item.get("doi") or "",
-                "abstract": abstract[:1500],
+                "abstract": abstract[:600],
             }
         )
     return papers
@@ -72,10 +86,10 @@ def summarize_papers_with_gemini(api_key: str, papers: list[dict]) -> dict:
     papers_text = json.dumps(papers, ensure_ascii=False)
     prompt = f"""
 以下はOpenAlexから取得した最新のインストラクショナルデザイン関連論文のリストです。
-JSON形式で以下を出力してください。
+JSON形式で以下を簡潔に出力してください。
 
-1. "trends": 全体の傾向から見える「最近の注目トピック」を3つ（各トピック名と1〜2文の説明）
-2. "items": 各論文について、日本語タイトル("ja_title")・3行要約("summary")・教育実践への問いかけヒント("hint")
+1. "trends": 全体の傾向から見える「最近の注目トピック」を3つ（各トピック名と1文の説明）
+2. "items": 各論文について、日本語タイトル("ja_title")・2〜3行の簡潔な要約("summary")・教育実践への問いかけヒント("hint")
 
 入力論文データ:
 {papers_text}
@@ -110,8 +124,9 @@ JSON形式で以下を出力してください。
         "required": ["trends", "items"],
     }
 
-    response = client.models.generate_content(
-        model="gemini-3.8-flash",
+    response = generate_with_retry(
+        client,
+        model=MODEL_NAME,
         contents=prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
@@ -138,8 +153,9 @@ def ask_coach(api_key: str, paper_context: dict, history: list[dict]) -> str:
         )
         for m in history
     ]
-    response = client.models.generate_content(
-        model="gemini-3.8-flash",
+    response = generate_with_retry(
+        client,
+        model=MODEL_NAME,
         contents=contents,
         config=types.GenerateContentConfig(
             system_instruction=system_text,
@@ -186,7 +202,7 @@ st.caption("OpenAlexの最新論文からトレンドを掴み、自分の教育
 if fetch_btn:
     with st.spinner("OpenAlexから論文を取得し、トピックを整理しています..."):
         try:
-            papers = fetch_openalex_papers(query=query, days=days, max_results=8)
+            papers = fetch_openalex_papers(query=query, days=days, max_results=5)
             if not papers:
                 st.warning("該当する論文が見つかりませんでした。キーワードや期間を変えてみてください。")
             else:
