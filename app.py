@@ -3,6 +3,7 @@ import json
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
+from pathlib import Path
 import requests
 import streamlit as st
 from google import genai
@@ -267,92 +268,105 @@ if not api_key:
 st.title("🧭 ID論文トレンド × コーチング壁打ち")
 st.caption("最新論文からトレンドを掴み、自分の教育実践に引き寄せて壁打ちします。")
 
-if fetch_btn:
-    with st.status(f"{db_source} から論文を取得しています...", expanded=True) as status:
-        try:
-            if db_source == "PubMed":
-                papers = fetch_pubmed_papers(query=query, days=days, max_results=5)
-            else:
-                papers = fetch_openalex_papers(query=query, days=days, max_results=5)
+tab_app, tab_readme = st.tabs(["🧭 論文トレンド × 壁打ち", "📖 使い方（README）"])
 
-            st.session_state.papers = papers
-            st.session_state.last_source = db_source
+with tab_app:
+    if fetch_btn:
+        with st.status(f"{db_source} から論文を取得しています...", expanded=True) as status:
+            try:
+                if db_source == "PubMed":
+                    papers = fetch_pubmed_papers(query=query, days=days, max_results=5)
+                else:
+                    papers = fetch_openalex_papers(query=query, days=days, max_results=5)
 
-            if not papers:
-                st.session_state.summary_data = None
-                status.update(label="該当する論文が見つかりませんでした", state="complete")
-            else:
-                st.write(f"{len(papers)}件の論文を取得しました。日本語で概要を作成中...")
-                try:
-                    summary_data = summarize_papers_with_gemini(api_key, papers)
-                    st.session_state.summary_data = summary_data
-                    status.update(label="完了しました！", state="complete")
-                except Exception as e:
+                st.session_state.papers = papers
+                st.session_state.last_source = db_source
+
+                if not papers:
                     st.session_state.summary_data = None
-                    status.update(label="論文は取得できましたが、日本語概要の作成がタイムアウトしました", state="error")
-                    st.warning(f"Gemini側が混雑しているため英語の論文一覧のみ表示します（詳細: {e}）")
-        except Exception as e:
-            status.update(label="論文の取得でエラーが発生しました", state="error")
-            st.error(f"エラー: {e}")
-
-col_left, col_right = st.columns([1.1, 1.0], gap="large")
-
-# --- 左カラム：論文トピックまとめ ---
-with col_left:
-    source_label = f"（{st.session_state.last_source}）" if st.session_state.last_source else ""
-    st.subheader(f"📚 最近のトピックと論文 {source_label}")
-    if not st.session_state.papers:
-        st.info("左のサイドバーから「論文を取得してまとめる」を押してください。")
-    else:
-        items = (st.session_state.summary_data or {}).get("items", [])
-        trends = (st.session_state.summary_data or {}).get("trends", [])
-        for t in trends:
-            st.markdown(f"**・{t['topic']}**：{t['description']}")
-
-        st.markdown("#### 取得した論文")
-        for idx, paper in enumerate(st.session_state.papers):
-            item = items[idx] if idx < len(items) else {}
-            display_title = item.get("ja_title") or paper["title"]
-            summary_text = item.get("summary") or paper["abstract"]
-
-            with st.expander(f"{display_title}（{paper['date']}）"):
-                st.caption(f"原題: {paper['title']} / {paper['journal']}")
-                st.write(summary_text)
-                if paper["url"]:
-                    st.markdown(f"[論文リンク]({paper['url']})")
-                if st.button("この論文で壁打ちする", key=f"coach_{idx}"):
-                    merged = {**paper, **item}
-                    st.session_state.selected_paper = merged
-                    first_q = (
-                        f"「{display_title}」をテーマに壁打ちですね。\n\n"
-                        f"この論文の内容を聞いたとき、ご自身の担当している授業や研修のどんな場面・誰の顔が浮かびましたか？"
-                    )
-                    st.session_state.messages = [{"role": "assistant", "content": first_q}]
-                    st.rerun()
-
-# --- 右カラム：コーチング壁打ち ---
-with col_right:
-    st.subheader("💬 コーチング壁打ち")
-    if not st.session_state.selected_paper:
-        st.info("左の論文リストから「この論文で壁打ちする」を押すと、対話が始まります。")
-    else:
-        sp = st.session_state.selected_paper
-        st.success(f"テーマ：{sp.get('ja_title', sp['title'])}")
-
-        for msg in st.session_state.messages:
-            with st.chat_message(msg["role"]):
-                st.write(msg["content"])
-
-        if user_input := st.chat_input("思ったことや現場の状況を書いてみてください..."):
-            st.session_state.messages.append({"role": "user", "content": user_input})
-            with st.chat_message("user"):
-                st.write(user_input)
-
-            with st.chat_message("assistant"):
-                with st.spinner("考えています..."):
+                    status.update(label="該当する論文が見つかりませんでした", state="complete")
+                else:
+                    st.write(f"{len(papers)}件の論文を取得しました。日本語で概要を作成中...")
                     try:
-                        reply = ask_coach(api_key, sp, st.session_state.messages)
-                        st.write(reply)
-                        st.session_state.messages.append({"role": "assistant", "content": reply})
+                        summary_data = summarize_papers_with_gemini(api_key, papers)
+                        st.session_state.summary_data = summary_data
+                        status.update(label="完了しました！", state="complete")
                     except Exception as e:
-                        st.error(f"応答の生成に失敗しました（時間を置いて再度お試しください）: {e}")
+                        st.session_state.summary_data = None
+                        status.update(label="論文は取得できましたが、日本語概要の作成がタイムアウトしました", state="error")
+                        st.warning(f"Gemini側が混雑しているため英語の論文一覧のみ表示します（詳細: {e}）")
+            except Exception as e:
+                status.update(label="論文の取得でエラーが発生しました", state="error")
+                st.error(f"エラー: {e}")
+
+    col_left, col_right = st.columns([1.1, 1.0], gap="large")
+
+    # --- 左カラム：論文トピックまとめ ---
+    with col_left:
+        source_label = f"（{st.session_state.last_source}）" if st.session_state.last_source else ""
+        st.subheader(f"📚 最近のトピックと論文 {source_label}")
+        if not st.session_state.papers:
+            st.info("左のサイドバーから「論文を取得してまとめる」を押してください。")
+        else:
+            items = (st.session_state.summary_data or {}).get("items", [])
+            trends = (st.session_state.summary_data or {}).get("trends", [])
+            for t in trends:
+                st.markdown(f"**・{t['topic']}**：{t['description']}")
+
+            st.markdown("#### 取得した論文")
+            for idx, paper in enumerate(st.session_state.papers):
+                item = items[idx] if idx < len(items) else {}
+                display_title = item.get("ja_title") or paper["title"]
+                summary_text = item.get("summary") or paper["abstract"]
+
+                with st.expander(f"{display_title}（{paper['date']}）"):
+                    st.caption(f"原題: {paper['title']} / {paper['journal']}")
+                    st.write(summary_text)
+                    if paper["url"]:
+                        st.markdown(f"[論文リンク]({paper['url']})")
+                    if st.button("この論文で壁打ちする", key=f"coach_{idx}"):
+                        merged = {**paper, **item}
+                        st.session_state.selected_paper = merged
+                        first_q = (
+                            f"「{display_title}」をテーマに壁打ちですね。\n\n"
+                            f"この論文の内容を聞いたとき、ご自身の担当している授業や研修のどんな場面・誰の顔が浮かびましたか？"
+                        )
+                        st.session_state.messages = [{"role": "assistant", "content": first_q}]
+                        st.rerun()
+
+    # --- 右カラム：コーチング壁打ち ---
+    with col_right:
+        st.subheader("💬 コーチング壁打ち")
+        if not st.session_state.selected_paper:
+            st.info("左の論文リストから「この論文で壁打ちする」を押すと、対話が始まります。")
+        else:
+            sp = st.session_state.selected_paper
+            st.success(f"テーマ：{sp.get('ja_title', sp['title'])}")
+
+            chat_box = st.container()
+            with chat_box:
+                for msg in st.session_state.messages:
+                    with st.chat_message(msg["role"]):
+                        st.write(msg["content"])
+
+            if user_input := st.chat_input("思ったことや現場の状況を書いてみてください..."):
+                st.session_state.messages.append({"role": "user", "content": user_input})
+                with chat_box:
+                    with st.chat_message("user"):
+                        st.write(user_input)
+
+                    with st.chat_message("assistant"):
+                        with st.spinner("考えています..."):
+                            try:
+                                reply = ask_coach(api_key, sp, st.session_state.messages)
+                                st.write(reply)
+                                st.session_state.messages.append({"role": "assistant", "content": reply})
+                            except Exception as e:
+                                st.error(f"応答の生成に失敗しました（時間を置いて再度お試しください）: {e}")
+
+with tab_readme:
+    readme_path = next((p for p in [Path("README.md"), Path("Readme.md")] if p.exists()), None)
+    if readme_path:
+        st.markdown(readme_path.read_text(encoding="utf-8"))
+    else:
+        st.info("リポジトリに README.md を置くと、ここに使い方が表示されます。")
