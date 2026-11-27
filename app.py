@@ -111,7 +111,7 @@ JSON形式で以下を出力してください。
     }
 
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-3.8-flash",
         contents=prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
@@ -139,7 +139,7 @@ def ask_coach(api_key: str, paper_context: dict, history: list[dict]) -> str:
         for m in history
     ]
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-3.8-flash",
         contents=contents,
         config=types.GenerateContentConfig(
             system_instruction=system_text,
