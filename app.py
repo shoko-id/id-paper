@@ -1,6 +1,8 @@
 import datetime
 import json
 import time
+import urllib.parse
+import xml.etree.ElementTree as ET
 import requests
 import streamlit as st
 from google import genai
@@ -25,6 +27,13 @@ COACH_SYSTEM_PROMPT = """
 """.strip()
 
 
+def get_client(api_key: str) -> genai.Client:
+    return genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(timeout=20000),
+    )
+
+
 def reconstruct_abstract(inv_index: dict | None) -> str:
     if not inv_index:
         return ""
@@ -36,24 +45,30 @@ def reconstruct_abstract(inv_index: dict | None) -> str:
 
 
 def generate_with_retry(client: genai.Client, **kwargs):
-    for attempt in range(3):
+    for attempt in range(2):
         try:
             return client.models.generate_content(**kwargs)
         except Exception as e:
-            if "503" in str(e) and attempt < 2:
-                time.sleep(2 * (attempt + 1))
+            if "503" in str(e) and attempt == 0:
+                time.sleep(1.5)
                 continue
             raise
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_openalex_papers(query: str, days: int, max_results: int = 5) -> list[dict]:
-    since_date = (datetime.date.today() - datetime.timedelta(days=days)).isoformat()
+    today = datetime.date.today()
+    since_date = (today - datetime.timedelta(days=days)).isoformat()
+    today_str = today.isoformat()
     url = "https://api.openalex.org/works"
     params = {
         "search": query,
-        "filter": f"has_abstract:true,from_publication_date:{since_date}",
-        "sort": "publication_date:desc",
+        "filter": (
+            f"has_abstract:true,type:article,"
+            f"from_publication_date:{since_date},to_publication_date:{today_str},"
+            f"title_and_abstract.search:{query}"
+        ),
+        "sort": "relevance_score:desc",
         "per-page": max_results,
         "select": "id,title,publication_date,doi,primary_location,abstract_inverted_index",
     }
@@ -73,8 +88,66 @@ def fetch_openalex_papers(query: str, days: int, max_results: int = 5) -> list[d
                 "title": item.get("title", "No Title"),
                 "date": item.get("publication_date", ""),
                 "journal": source.get("display_name", "Unknown Journal"),
-                "doi": item.get("doi") or "",
-                "abstract": abstract[:600],
+                "url": item.get("doi") or "",
+                "abstract": abstract[:350],
+            }
+        )
+    return papers
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_pubmed_papers(query: str, days: int, max_results: int = 5) -> list[dict]:
+    search_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+    search_params = {
+        "db": "pubmed",
+        "term": f"({query}[Title/Abstract])",
+        "reldate": days,
+        "datetype": "pdat",
+        "retmax": max_results,
+        "sort": "relevance",
+        "retmode": "json",
+    }
+    s_res = requests.get(search_url, params=search_params, timeout=15)
+    s_res.raise_for_status()
+    id_list = s_res.json().get("esearchresult", {}).get("idlist", [])
+    if not id_list:
+        return []
+
+    fetch_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+    fetch_params = {
+        "db": "pubmed",
+        "id": ",".join(id_list),
+        "retmode": "xml",
+    }
+    f_res = requests.get(fetch_url, params=fetch_params, timeout=15)
+    f_res.raise_for_status()
+
+    root = ET.fromstring(f_res.text)
+    papers = []
+    for article in root.findall(".//PubmedArticle"):
+        pmid = article.findtext(".//MedlineCitation/PMID", "")
+        title_el = article.find(".//ArticleTitle")
+        title = "".join(title_el.itertext()).strip() if title_el is not None else "No Title"
+        journal = article.findtext(".//Journal/Title", "PubMed")
+
+        year = article.findtext(".//JournalIssue/PubDate/Year", "")
+        month = article.findtext(".//JournalIssue/PubDate/Month", "")
+        day = article.findtext(".//JournalIssue/PubDate/Day", "")
+        date_str = "-".join([p for p in (year, month, day) if p]) or "日付不明"
+
+        abs_els = article.findall(".//Abstract/AbstractText")
+        abstract = " ".join("".join(el.itertext()).strip() for el in abs_els if el is not None)
+        if not abstract:
+            abstract = "(抄録なし)"
+
+        papers.append(
+            {
+                "id": pmid,
+                "title": title,
+                "date": date_str,
+                "journal": journal,
+                "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" if pmid else "",
+                "abstract": abstract[:350],
             }
         )
     return papers
@@ -82,69 +155,41 @@ def fetch_openalex_papers(query: str, days: int, max_results: int = 5) -> list[d
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def summarize_papers_with_gemini(api_key: str, papers: list[dict]) -> dict:
-    client = genai.Client(api_key=api_key)
-    papers_text = json.dumps(papers, ensure_ascii=False)
+    client = get_client(api_key)
+    compact_inputs = [
+        {"title": p["title"], "abstract": p["abstract"]}
+        for p in papers
+    ]
     prompt = f"""
-以下はOpenAlexから取得した最新のインストラクショナルデザイン関連論文のリストです。
-JSON形式で以下を簡潔に出力してください。
+以下の論文リストを次のJSON形式のみで超簡潔にまとめてください。余計な説明は不要です。
+{{
+  "trends": [{{"topic": "注目トピック名", "description": "1文で簡潔に"}}],
+  "items": [{{"ja_title": "自然な日本語タイトル", "summary": "要点を1〜2文で簡潔に"}}]
+}}
+trendsは3つ、itemsは入力論文と同じ順番・同じ件数で出力してください。
 
-1. "trends": 全体の傾向から見える「最近の注目トピック」を3つ（各トピック名と1文の説明）
-2. "items": 各論文について、日本語タイトル("ja_title")・2〜3行の簡潔な要約("summary")・教育実践への問いかけヒント("hint")
-
-入力論文データ:
-{papers_text}
+論文データ:
+{json.dumps(compact_inputs, ensure_ascii=False)}
 """
-    schema = {
-        "type": "OBJECT",
-        "properties": {
-            "trends": {
-                "type": "ARRAY",
-                "items": {
-                    "type": "OBJECT",
-                    "properties": {
-                        "topic": {"type": "STRING"},
-                        "description": {"type": "STRING"},
-                    },
-                    "required": ["topic", "description"],
-                },
-            },
-            "items": {
-                "type": "ARRAY",
-                "items": {
-                    "type": "OBJECT",
-                    "properties": {
-                        "ja_title": {"type": "STRING"},
-                        "summary": {"type": "STRING"},
-                        "hint": {"type": "STRING"},
-                    },
-                    "required": ["ja_title", "summary", "hint"],
-                },
-            },
-        },
-        "required": ["trends", "items"],
-    }
-
     response = generate_with_retry(
         client,
         model=MODEL_NAME,
         contents=prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
-            response_schema=schema,
-            temperature=0.3,
+            temperature=0.2,
         ),
     )
     return json.loads(response.text)
 
 
 def ask_coach(api_key: str, paper_context: dict, history: list[dict]) -> str:
-    client = genai.Client(api_key=api_key)
+    client = get_client(api_key)
     system_text = (
         f"{COACH_SYSTEM_PROMPT}\n\n"
         f"【今回壁打ちのきっかけにしている論文】\n"
-        f"タイトル: {paper_context['ja_title']} ({paper_context['title']})\n"
-        f"要約: {paper_context['summary']}\n"
-        f"ヒント: {paper_context['hint']}"
+        f"タイトル: {paper_context.get('ja_title', paper_context['title'])}\n"
+        f"要約: {paper_context.get('summary', paper_context['abstract'])}"
     )
     contents = [
         types.Content(
@@ -171,6 +216,7 @@ for key, default in {
     "summary_data": None,
     "selected_paper": None,
     "messages": [],
+    "last_source": "",
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -178,17 +224,32 @@ for key, default in {
 # --- サイドバー ---
 with st.sidebar:
     st.header("🔍 論文検索設定")
-    query = st.text_input("検索キーワード（英語推奨）", value="instructional design")
-    period_label = st.radio("対象期間", ["直近6ヶ月", "直近1年"], index=1)
+    db_source = st.radio(
+        "検索データベース",
+        ["PubMed", "OpenAlex"],
+        horizontal=True,
+    )
+    st.caption(
+        "・**PubMed**: 医学・医療教育・臨床指導の論文に特化（ノイズが少なめ）\n"
+        "・**OpenAlex**: 教育工学・企業研修・大学教育などID全般を広く網羅\n"
+        "・**Google Scholar**: 公式APIがないため下のボタンから直接検索できます"
+    )
+
+    query = st.text_input("検索キーワード（英語推奨）", value="medical education")
+    period_label = st.radio("対象期間", ["直近6ヶ月", "直近1年"], index=1, horizontal=True)
     days = 180 if period_label == "直近6ヶ月" else 365
 
     fetch_btn = st.button("論文を取得してまとめる", type="primary", use_container_width=True)
+
+    gs_url = f"https://scholar.google.com/scholar?q={urllib.parse.quote(query)}"
+    st.link_button("Google Scholarで同じ語を検索 ↗", gs_url, use_container_width=True)
+
     if st.button("壁打ちをリセット", use_container_width=True):
         st.session_state.selected_paper = None
         st.session_state.messages = []
         st.rerun()
 
-    st.caption("キーワード例: `ARCS model`, `self-regulated learning`, `medical education`")
+    st.caption("キーワード例: `instructional design`, `ARCS model`, `medical education`")
 
 # --- APIキー確認 ---
 api_key = st.secrets.get("GEMINI_API_KEY", "")
@@ -197,46 +258,66 @@ if not api_key:
     st.stop()
 
 st.title("🧭 ID論文トレンド × コーチング壁打ち")
-st.caption("OpenAlexの最新論文からトレンドを掴み、自分の教育実践に引き寄せて壁打ちします。")
+st.caption("最新論文からトレンドを掴み、自分の教育実践に引き寄せて壁打ちします。")
 
 if fetch_btn:
-    with st.spinner("OpenAlexから論文を取得し、トピックを整理しています..."):
+    with st.status(f"{db_source} から論文を取得しています...", expanded=True) as status:
         try:
-            papers = fetch_openalex_papers(query=query, days=days, max_results=5)
-            if not papers:
-                st.warning("該当する論文が見つかりませんでした。キーワードや期間を変えてみてください。")
+            if db_source == "PubMed":
+                papers = fetch_pubmed_papers(query=query, days=days, max_results=5)
             else:
-                summary_data = summarize_papers_with_gemini(api_key, papers)
-                st.session_state.papers = papers
-                st.session_state.summary_data = summary_data
+                papers = fetch_openalex_papers(query=query, days=days, max_results=5)
+
+            st.session_state.papers = papers
+            st.session_state.last_source = db_source
+
+            if not papers:
+                st.session_state.summary_data = None
+                status.update(label="該当する論文が見つかりませんでした", state="complete")
+            else:
+                st.write(f"{len(papers)}件取得しました。AIで簡潔に整理中...")
+                try:
+                    summary_data = summarize_papers_with_gemini(api_key, papers)
+                    st.session_state.summary_data = summary_data
+                    status.update(label="完了しました！", state="complete")
+                except Exception as e:
+                    st.session_state.summary_data = None
+                    status.update(label="論文は取得できましたが、AI要約がタイムアウトしました", state="error")
+                    st.warning(f"Gemini側が混雑しているため英語の論文一覧のみ表示します（詳細: {e}）")
         except Exception as e:
-            st.error(f"取得または要約中にエラーが発生しました: {e}")
+            status.update(label="論文の取得でエラーが発生しました", state="error")
+            st.error(f"エラー: {e}")
 
 col_left, col_right = st.columns([1.1, 1.0], gap="large")
 
 # --- 左カラム：論文トピックまとめ ---
 with col_left:
-    st.subheader("📚 最近のトピックと論文")
-    if not st.session_state.summary_data:
+    source_label = f"（{st.session_state.last_source}）" if st.session_state.last_source else ""
+    st.subheader(f"📚 最近のトピックと論文 {source_label}")
+    if not st.session_state.papers:
         st.info("左のサイドバーから「論文を取得してまとめる」を押してください。")
     else:
-        trends = st.session_state.summary_data.get("trends", [])
+        items = (st.session_state.summary_data or {}).get("items", [])
+        trends = (st.session_state.summary_data or {}).get("trends", [])
         for t in trends:
             st.markdown(f"**・{t['topic']}**：{t['description']}")
 
         st.markdown("#### 取得した論文")
-        items = st.session_state.summary_data.get("items", [])
-        for idx, (paper, item) in enumerate(zip(st.session_state.papers, items)):
-            with st.expander(f"{item['ja_title']}（{paper['date']}）"):
+        for idx, paper in enumerate(st.session_state.papers):
+            item = items[idx] if idx < len(items) else {}
+            display_title = item.get("ja_title") or paper["title"]
+            summary_text = item.get("summary") or paper["abstract"]
+
+            with st.expander(f"{display_title}（{paper['date']}）"):
                 st.caption(f"原題: {paper['title']} / {paper['journal']}")
-                st.write(item["summary"])
-                if paper["doi"]:
-                    st.markdown(f"[論文リンク (DOI)]({paper['doi']})")
+                st.write(summary_text)
+                if paper["url"]:
+                    st.markdown(f"[論文リンク]({paper['url']})")
                 if st.button("この論文で壁打ちする", key=f"coach_{idx}"):
                     merged = {**paper, **item}
                     st.session_state.selected_paper = merged
                     first_q = (
-                        f"「{item['ja_title']}」をテーマに壁打ちですね。\n\n"
+                        f"「{display_title}」をテーマに壁打ちですね。\n\n"
                         f"この論文の内容を聞いたとき、ご自身の担当している授業や研修のどんな場面・誰の顔が浮かびましたか？"
                     )
                     st.session_state.messages = [{"role": "assistant", "content": first_q}]
@@ -249,7 +330,7 @@ with col_right:
         st.info("左の論文リストから「この論文で壁打ちする」を押すと、対話が始まります。")
     else:
         sp = st.session_state.selected_paper
-        st.success(f"テーマ：{sp['ja_title']}")
+        st.success(f"テーマ：{sp.get('ja_title', sp['title'])}")
 
         for msg in st.session_state.messages:
             with st.chat_message(msg["role"]):
@@ -262,6 +343,9 @@ with col_right:
 
             with st.chat_message("assistant"):
                 with st.spinner("考えています..."):
-                    reply = ask_coach(api_key, sp, st.session_state.messages)
-                    st.write(reply)
-            st.session_state.messages.append({"role": "assistant", "content": reply})
+                    try:
+                        reply = ask_coach(api_key, sp, st.session_state.messages)
+                        st.write(reply)
+                        st.session_state.messages.append({"role": "assistant", "content": reply})
+                    except Exception as e:
+                        st.error(f"応答の生成に失敗しました（時間を置いて再度お試しください）: {e}")
