@@ -30,7 +30,7 @@ COACH_SYSTEM_PROMPT = """
 def get_client(api_key: str) -> genai.Client:
     return genai.Client(
         api_key=api_key,
-        http_options=types.HttpOptions(timeout=20000),
+        http_options=types.HttpOptions(timeout=45000),
     )
 
 
@@ -50,7 +50,7 @@ def generate_with_retry(client: genai.Client, **kwargs):
             return client.models.generate_content(**kwargs)
         except Exception as e:
             if "503" in str(e) and attempt == 0:
-                time.sleep(1.5)
+                time.sleep(2)
                 continue
             raise
 
@@ -89,7 +89,7 @@ def fetch_openalex_papers(query: str, days: int, max_results: int = 5) -> list[d
                 "date": item.get("publication_date", ""),
                 "journal": source.get("display_name", "Unknown Journal"),
                 "url": item.get("doi") or "",
-                "abstract": abstract[:350],
+                "abstract": abstract[:300],
             }
         )
     return papers
@@ -98,12 +98,17 @@ def fetch_openalex_papers(query: str, days: int, max_results: int = 5) -> list[d
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_pubmed_papers(query: str, days: int, max_results: int = 5) -> list[dict]:
     search_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+    term = (
+        f'({query}[Title/Abstract]) AND hasabstract AND "journal article"[Publication Type] '
+        f'NOT ("editorial"[Publication Type] OR "letter"[Publication Type] '
+        f'OR "comment"[Publication Type] OR "news"[Publication Type])'
+    )
     search_params = {
         "db": "pubmed",
-        "term": f"({query}[Title/Abstract])",
+        "term": term,
         "reldate": days,
         "datetype": "pdat",
-        "retmax": max_results,
+        "retmax": 12,
         "sort": "relevance",
         "retmode": "json",
     }
@@ -125,6 +130,11 @@ def fetch_pubmed_papers(query: str, days: int, max_results: int = 5) -> list[dic
     root = ET.fromstring(f_res.text)
     papers = []
     for article in root.findall(".//PubmedArticle"):
+        abs_els = article.findall(".//Abstract/AbstractText")
+        abstract = " ".join("".join(el.itertext()).strip() for el in abs_els if el is not None).strip()
+        if not abstract:
+            continue
+
         pmid = article.findtext(".//MedlineCitation/PMID", "")
         title_el = article.find(".//ArticleTitle")
         title = "".join(title_el.itertext()).strip() if title_el is not None else "No Title"
@@ -135,11 +145,6 @@ def fetch_pubmed_papers(query: str, days: int, max_results: int = 5) -> list[dic
         day = article.findtext(".//JournalIssue/PubDate/Day", "")
         date_str = "-".join([p for p in (year, month, day) if p]) or "日付不明"
 
-        abs_els = article.findall(".//Abstract/AbstractText")
-        abstract = " ".join("".join(el.itertext()).strip() for el in abs_els if el is not None)
-        if not abstract:
-            abstract = "(抄録なし)"
-
         papers.append(
             {
                 "id": pmid,
@@ -147,9 +152,11 @@ def fetch_pubmed_papers(query: str, days: int, max_results: int = 5) -> list[dic
                 "date": date_str,
                 "journal": journal,
                 "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" if pmid else "",
-                "abstract": abstract[:350],
+                "abstract": abstract[:300],
             }
         )
+        if len(papers) >= max_results:
+            break
     return papers
 
 
@@ -161,10 +168,10 @@ def summarize_papers_with_gemini(api_key: str, papers: list[dict]) -> dict:
         for p in papers
     ]
     prompt = f"""
-以下の論文リストを次のJSON形式のみで超簡潔にまとめてください。余計な説明は不要です。
+以下の論文リストを次のJSON形式のみで簡潔に日本語でまとめてください。余計な説明は不要です。
 {{
   "trends": [{{"topic": "注目トピック名", "description": "1文で簡潔に"}}],
-  "items": [{{"ja_title": "自然な日本語タイトル", "summary": "要点を1〜2文で簡潔に"}}]
+  "items": [{{"ja_title": "自然な日本語タイトル", "summary": "日本語の概要を2文で簡潔に"}}]
 }}
 trendsは3つ、itemsは入力論文と同じ順番・同じ件数で出力してください。
 
@@ -189,7 +196,7 @@ def ask_coach(api_key: str, paper_context: dict, history: list[dict]) -> str:
         f"{COACH_SYSTEM_PROMPT}\n\n"
         f"【今回壁打ちのきっかけにしている論文】\n"
         f"タイトル: {paper_context.get('ja_title', paper_context['title'])}\n"
-        f"要約: {paper_context.get('summary', paper_context['abstract'])}"
+        f"概要: {paper_context.get('summary', paper_context['abstract'])}"
     )
     contents = [
         types.Content(
@@ -275,14 +282,14 @@ if fetch_btn:
                 st.session_state.summary_data = None
                 status.update(label="該当する論文が見つかりませんでした", state="complete")
             else:
-                st.write(f"{len(papers)}件取得しました。AIで簡潔に整理中...")
+                st.write(f"{len(papers)}件の論文を取得しました。日本語で概要を作成中...")
                 try:
                     summary_data = summarize_papers_with_gemini(api_key, papers)
                     st.session_state.summary_data = summary_data
                     status.update(label="完了しました！", state="complete")
                 except Exception as e:
                     st.session_state.summary_data = None
-                    status.update(label="論文は取得できましたが、AI要約がタイムアウトしました", state="error")
+                    status.update(label="論文は取得できましたが、日本語概要の作成がタイムアウトしました", state="error")
                     st.warning(f"Gemini側が混雑しているため英語の論文一覧のみ表示します（詳細: {e}）")
         except Exception as e:
             status.update(label="論文の取得でエラーが発生しました", state="error")
