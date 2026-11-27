@@ -1,8 +1,6 @@
 # 🧭 ID論文トレンド × コーチング壁打ち
 
-[[https://img.shields.io/badge/Streamlit-アプリを開く-FF4B4B?logo=streamlit&logoColor=white]](https://id-paper.streamlit.app/)
-[https://img.shields.io/badge/Made_with-Python-3776AB?logo=python&logoColor=white]
-[https://img.shields.io/badge/AI-Gemini_API-4285F4?logo=google&logoColor=white]
+`Streamlit` `Python` `Gemini API`
 
 > 🚀 **公開URL**: [https://id-paper.streamlit.app/](https://id-paper.streamlit.app/)
 
